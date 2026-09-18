@@ -1,0 +1,7 @@
+{
+  "name": "Vero - Code computes. Static analysis detects. Jev decides.",
+  "description": "An evidence-based GitHub Pull Request engineering analysis platform combining GitHub diff data, SonarQube static analysis, TypeSafe Jev structured decisions, and deterministic decision rules.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
