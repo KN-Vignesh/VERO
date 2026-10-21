@@ -20,6 +20,15 @@ import {
   TrialStatus,
   TrialHistoryItem,
 } from './types.js';
+import {
+  getClientTrialStatus,
+  runClientFallbackAnalysis,
+} from './clientAnalysisFallback.js';
+
+const API_BASE_URL = (
+  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL) ||
+  ''
+).replace(/\/$/, '');
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('analyzer');
@@ -81,26 +90,29 @@ export default function App() {
     fetchTrialStatus(userGithubToken, key);
   };
 
-  // Fetch current trial quota and 24h cooling status
+  // Fetch current trial quota and 24h cooling status (with static-host fallback)
   const fetchTrialStatus = useCallback(
     async (ghToken?: string, tsKey?: string) => {
+      const activeGh = ghToken !== undefined ? ghToken : userGithubToken;
+      const activeTs = tsKey !== undefined ? tsKey : userTypesafeKey;
       try {
         const headers: Record<string, string> = {
           'x-client-session-id': clientSessionId,
         };
-        const activeGh = ghToken !== undefined ? ghToken : userGithubToken;
-        const activeTs = tsKey !== undefined ? tsKey : userTypesafeKey;
         if (activeGh) headers['x-user-github-token'] = activeGh;
         if (activeTs) headers['x-user-typesafe-key'] = activeTs;
 
-        const res = await fetch('/api/trial-status', { headers });
-        if (res.ok) {
+        const res = await fetch(`${API_BASE_URL}/api/trial-status`, { headers });
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
           const data: TrialStatus = await res.json();
           setTrialStatus(data);
+          return;
         }
-      } catch (e) {
-        console.error('Failed to fetch trial status:', e);
+      } catch {
+        // Static hosting or offline backend — fall through to client-side trial status
       }
+      setTrialStatus(getClientTrialStatus(activeGh, activeTs));
     },
     [clientSessionId, userGithubToken, userTypesafeKey]
   );
@@ -115,50 +127,81 @@ export default function App() {
     localStorage.removeItem('prs_trial_history');
   };
 
-  // Trigger analysis
+  // Trigger analysis (uses Express API when available, automatically falls back to browser pipeline on static hosts like GitHub Pages / is-a.dev)
   const handleAnalyze = async (url: string) => {
     setIsLoading(true);
     setError(null);
     setCurrentUrl(url);
 
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'x-client-session-id': clientSessionId,
-      };
-      if (userGithubToken) headers['x-user-github-token'] = userGithubToken;
-      if (userTypesafeKey) headers['x-user-typesafe-key'] = userTypesafeKey;
+      let data: AnalysisResult | null = null;
 
-      const response = await fetch('/api/analyze-pr', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ prUrl: url }),
-      });
+      try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'x-client-session-id': clientSessionId,
+        };
+        if (userGithubToken) headers['x-user-github-token'] = userGithubToken;
+        if (userTypesafeKey) headers['x-user-typesafe-key'] = userTypesafeKey;
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        if (response.status === 429) {
-          // Trial quota exceeded
-          if (errData.trialsUsed !== undefined) {
-            setTrialStatus((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    trialsUsed: errData.trialsUsed,
-                    coolingResetMs: errData.coolingResetMs || prev.coolingResetMs,
-                  }
-                : null
+        const response = await fetch(`${API_BASE_URL}/api/analyze-pr`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ prUrl: url }),
+        });
+
+        const contentType = response.headers.get('content-type') || '';
+        const isStaticHostFallbackStatus =
+          response.status === 404 ||
+          response.status === 405 ||
+          response.status === 501 ||
+          response.status === 502 ||
+          response.status === 503 ||
+          response.status === 504;
+
+        if (response.ok && contentType.includes('application/json')) {
+          data = await response.json();
+        } else if (isStaticHostFallbackStatus || !contentType.includes('application/json')) {
+          // Deployed on a static host (e.g., GitHub Pages / is-a.dev) where POST /api/analyze-pr returns 405 Method Not Allowed
+          data = await runClientFallbackAnalysis(url, userGithubToken, userTypesafeKey);
+        } else {
+          const errData = await response.json().catch(() => ({}));
+          if (response.status === 429) {
+            if (errData.trialsUsed !== undefined) {
+              setTrialStatus((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      trialsUsed: errData.trialsUsed,
+                      coolingResetMs: errData.coolingResetMs || prev.coolingResetMs,
+                    }
+                  : null
+              );
+            }
+            throw new Error(
+              errData.error ||
+                'Trial limit reached: 3 distinct Pull Requests have been analyzed in this 24-hour cooling period. Specify your GitHub Personal Access Token in Settings for unlimited analyses.'
             );
           }
-          throw new Error(
-            errData.error ||
-              'Trial limit reached: 3 distinct Pull Requests have been analyzed in this 24-hour cooling period. Specify your GitHub Personal Access Token in Settings for unlimited analyses.'
-          );
+          throw new Error(errData.error || `HTTP error ${response.status}: Failed to analyze PR`);
         }
-        throw new Error(errData.error || `HTTP error ${response.status}: Failed to analyze PR`);
+      } catch (networkOrApiErr: any) {
+        // If it's a known 400 or 429 validation/quota error from the backend, rethrow it
+        if (
+          networkOrApiErr?.message?.includes('Trial limit reached') ||
+          networkOrApiErr?.message?.includes('24-Hour Free Trial Limit Reached') ||
+          networkOrApiErr?.message?.includes('Invalid GitHub Pull Request URL')
+        ) {
+          throw networkOrApiErr;
+        }
+        // Network failure or static host rejection — execute client-side analysis pipeline
+        data = await runClientFallbackAnalysis(url, userGithubToken, userTypesafeKey);
       }
 
-      const data: AnalysisResult = await response.json();
+      if (!data) {
+        throw new Error('Failed to generate PR analysis result.');
+      }
+
       setAnalysis(data);
       if (data.trialStatus) {
         setTrialStatus(data.trialStatus);
@@ -179,7 +222,7 @@ export default function App() {
 
       setTrialHistory((prev) => {
         // Filter out prior entry of exact same PR url so latest is on top
-        const filtered = prev.filter((item) => item.url.toLowerCase() !== data.pullRequest.url.toLowerCase());
+        const filtered = prev.filter((item) => item.url.toLowerCase() !== data!.pullRequest.url.toLowerCase());
         const updated = [historyItem, ...filtered].slice(0, 30);
         localStorage.setItem('prs_trial_history', JSON.stringify(updated));
         return updated;
@@ -190,6 +233,9 @@ export default function App() {
       }
     } catch (err: any) {
       console.error('Analysis error:', err);
+      if (err?.status === 429 && err?.trialsUsed !== undefined) {
+        setTrialStatus(getClientTrialStatus(userGithubToken, userTypesafeKey));
+      }
       setError(err.message || 'An error occurred during PR analysis');
     } finally {
       setIsLoading(false);

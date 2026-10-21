@@ -53,6 +53,20 @@ async function startServer() {
 
   app.use(express.json());
 
+  // Enable CORS so static portfolio deployments (e.g., https://vignesh-k-n.is-a.dev) can call /api/* across origins
+  app.use('/api', (req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, x-client-session-id, x-user-github-token, x-user-typesafe-key'
+    );
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
+
   // API Route: Health Check
   app.get('/api/health', (req, res) => {
     res.json({
