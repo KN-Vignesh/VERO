@@ -120,12 +120,16 @@ export async function fetchPullRequestData(
 ): Promise<{ metadata: PullRequestMetadata; files: PullRequestFile[]; source: 'github_live_api' | 'verified_public_fixture' }> {
   const key = `${parsed.owner}/${parsed.repo}/pull/${parsed.pullNumber}`;
 
-  // Prioritize user-supplied token; fallback to server environment token
-  const token = (userGithubToken && userGithubToken.trim()) || process.env.GITHUB_TOKEN;
+  // Prioritize user-supplied token; fallback to server environment token (guarded for browser environments)
+  const serverToken =
+    typeof process !== 'undefined' && process.env ? process.env.GITHUB_TOKEN : undefined;
+  const token = (userGithubToken && userGithubToken.trim()) || serverToken;
   const headers: Record<string, string> = {
     'Accept': 'application/vnd.github.v3+json',
-    'User-Agent': 'Vero-PR-Analysis-Engine/1.0',
   };
+  if (typeof window === 'undefined') {
+    headers['User-Agent'] = 'Vero-PR-Analysis-Engine/1.0';
+  }
   if (token) {
     headers['Authorization'] = `Bearer ${token.trim()}`;
   }
